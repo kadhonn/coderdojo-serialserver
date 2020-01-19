@@ -13,7 +13,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Access-Control-Allow-Methods", "GET, POST")
 	answer := InvokeCommand(serial, r.URL.Path[1:], flat(r.URL.Query()))
 	log.Println("called " + r.URL.Path[1:] + " answer is: " + answer)
-	fmt.Fprintf(w, answer)
+	_, err := fmt.Fprintf(w, answer)
+	if err != nil {
+		log.Println(err)
+	}
 }
 
 func flat(query url.Values) map[string]string {

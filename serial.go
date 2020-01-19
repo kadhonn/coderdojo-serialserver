@@ -5,6 +5,7 @@ import (
 	serialPackage "go.bug.st/serial"
 	"log"
 	"strconv"
+	"time"
 )
 
 const CmdSerialBaud = 38400
@@ -57,8 +58,9 @@ type cmd struct {
 	answer chan string
 }
 type Serial struct {
-	port serialPackage.Port
-	cmds chan cmd
+	port        serialPackage.Port
+	cmds        chan cmd
+	readChannel chan []byte
 }
 
 func Open() (*Serial, error) {
@@ -70,8 +72,9 @@ func Open() (*Serial, error) {
 		return nil, err
 	}
 
-	s := &Serial{port: port, cmds: make(chan cmd)}
-	go s.run()
+	s := &Serial{port: port, cmds: make(chan cmd), readChannel: make(chan []byte)}
+	go s.runCmdHandler()
+	go s.runReadHandler()
 	return s, nil
 }
 
@@ -85,7 +88,7 @@ func InvokeCommand(serial *Serial, cmdName string, params map[string]string) str
 	return <-cmd.answer
 }
 
-func (serial *Serial) run() {
+func (serial *Serial) runCmdHandler() {
 	for {
 		select {
 		case cmd := <-serial.cmds:
@@ -109,36 +112,7 @@ func (serial *Serial) sendBytes(cmd byte, data1 byte, data2 byte, data3 byte, da
 		return nil, err
 	}
 
-	var readBytes = make([]byte, 20)
-	readBytes[0] = 0
-	var buf = make([]byte, 12)
-	//TODO blocks, can lead to server dying until restarted or bug restarted
-	//TODO read is reeeally friggin hacky and not race condition safe, rewrite!
-	for readBytes[len(readBytes)-1] != CmdTermByte {
-		read, err := serial.port.Read(buf)
-		if err != nil {
-			return nil, err
-		}
-		readBytes = append(readBytes, buf[:read]...)
-	}
-	for readBytes[0] != CmdSync0 {
-		readBytes = readBytes[1:]
-	}
-
-	for i, byte := range readBytes {
-		log.Println("byte[" + strconv.Itoa(i) + "]: " + strconv.Itoa(int(byte)))
-	}
-
-	//TODO crc check
-	if readBytes[3] != StatusAckOk {
-		return nil, errors.New("wrong status :( " + strconv.Itoa(int(readBytes[3])))
-	}
-
-	if readBytes[4] != cmd {
-		return nil, errors.New("wrong return :( " + strconv.Itoa(int(readBytes[4])) + " instead of " + strconv.Itoa(int(cmd)))
-	}
-
-	return readBytes[5:11], nil
+	return serial.readResponse(cmd)
 }
 
 func (serial *Serial) runCommand(cmd cmd) {
@@ -153,47 +127,122 @@ func (serial *Serial) runCommand(cmd cmd) {
 	close(cmd.answer)
 }
 
+func (serial *Serial) readResponse(cmd byte) ([]byte, error) {
+	select {
+	case response := <-serial.readChannel:
+		return response[5:], nil
+	case <-time.After(1 * time.Second):
+		return nil, errors.New("timeout when reading serial")
+	}
+}
+
+func (serial *Serial) runReadHandler() {
+	var readBytes = make([]byte, 0, 20)
+	var buf = make([]byte, 20)
+	scanPosition := 0
+	responseStart := -1
+	for {
+		read, err := serial.port.Read(buf)
+		if err != nil {
+			log.Println("error reading:", buf)
+			continue
+		}
+		readBytes = append(readBytes, buf[:read]...)
+		for ; scanPosition < len(readBytes); scanPosition++ {
+			if readBytes[scanPosition] == CmdSync0 {
+				responseStart = scanPosition
+			}
+			if readBytes[scanPosition] == CmdTermByte && responseStart != -1 {
+				bytes, err := validate(readBytes[responseStart : scanPosition+1])
+				if err != nil {
+					log.Println("error reading response", err)
+				} else {
+					serial.readChannel <- bytes
+				}
+				readBytes = make([]byte, 0, 20)
+				responseStart = -1
+				scanPosition = 0
+				break
+			}
+		}
+	}
+}
+
+func validate(readBytes []byte) ([]byte, error) {
+	for i, readByte := range readBytes {
+		log.Println("byte[" + strconv.Itoa(i) + "]: " + strconv.Itoa(int(readByte)))
+	}
+	if readBytes[0] != CmdSync0 {
+		return nil, errors.New("wrong sync byte 0 :( " + strconv.Itoa(int(readBytes[0])))
+	}
+	if readBytes[1] != CmdSync1 {
+		return nil, errors.New("wrong sync byte 1 :( " + strconv.Itoa(int(readBytes[1])))
+	}
+	var crc = calcCrc(readBytes)
+	if readBytes[2] != crc {
+		return nil, errors.New("wrong crc :( " + strconv.Itoa(int(crc)))
+	}
+	if readBytes[3] != StatusAckOk {
+		return nil, errors.New("wrong status :( " + strconv.Itoa(int(readBytes[3])))
+	}
+	return readBytes, nil
+}
+
+func calcCrc(bytes []byte) byte {
+	var crc byte = 0
+	for i := 0; i < len(bytes)-1; i++ {
+		if i != 2 {
+			crc ^= bytes[i]
+		}
+	}
+	return crc
+}
+
 var cmdMapping = map[string]serialCmd{
-	"reset":     &simpleOkCall{[]byte{CmdRegReset, 100, 100, 100}},
-	"power_on":  &simpleOkCall{[]byte{CmdRegPower, 1}},
-	"power_off": &simpleOkCall{[]byte{CmdRegPower, 0}},
+	"reset":     &okCall{[]byte{CmdRegReset, 100, 100, 100}},
+	"power_on":  &okCall{[]byte{CmdRegPower, 1}},
+	"power_off": &okCall{[]byte{CmdRegPower, 0}},
 
-	"walk_stop":       &simpleOkCall{[]byte{CmdRegWalk, 128, 128, 128}},
-	"walk_forward":    &simpleOkCall{[]byte{CmdRegWalk, 128, 0, 128}},
-	"walk_back":       &simpleOkCall{[]byte{CmdRegWalk, 128, 255, 128}},
-	"walk_left":       &simpleOkCall{[]byte{CmdRegWalk, 0, 128, 128}},
-	"walk_right":      &simpleOkCall{[]byte{CmdRegWalk, 255, 128, 128}},
-	"walk_turn_left":  &simpleOkCall{[]byte{CmdRegWalk, 128, 128, 0}},
-	"walk_turn_right": &simpleOkCall{[]byte{CmdRegWalk, 128, 128, 255}},
+	"walk_stop":       &okCall{[]byte{CmdRegWalk, 128, 128, 128}},
+	"walk_forward":    &okCall{[]byte{CmdRegWalk, 128, 0, 128}},
+	"walk_back":       &okCall{[]byte{CmdRegWalk, 128, 255, 128}},
+	"walk_left":       &okCall{[]byte{CmdRegWalk, 0, 128, 128}},
+	"walk_right":      &okCall{[]byte{CmdRegWalk, 255, 128, 128}},
+	"walk_turn_left":  &okCall{[]byte{CmdRegWalk, 128, 128, 0}},
+	"walk_turn_right": &okCall{[]byte{CmdRegWalk, 128, 128, 255}},
 
-	"sound": &simpleOkCall{[]byte{CmdRegSound, 50, 150}}, //TODO figure out parameters
+	"sound": &okCall{[]byte{CmdRegSound, 50, 150}}, //TODO figure out parameters
 
-	"body_height": &simpleParameterizedOkCall{CmdRegBodyHeight, []string{"height"}},
+	"body_height": &parameterizedOkCall{CmdRegBodyHeight, []string{"height"}, percentMapping(0, 130)},
+	"speed":       &parameterizedOkCall{CmdRegSpeed, []string{"speed"}, percentMapping(100, 0)},
 
-	"akku_charge": &simpleReturnCall{[]byte{CmdRegAkku}, convertAkkuCharge},
+	"akku_charge": &onlyReturnCall{[]byte{CmdRegAkku}, convertAkkuCharge},
 }
 
 type serialCmd interface {
 	call(*Serial, map[string]string) string
 }
 
-type simpleOkCall struct {
+type okCall struct {
 	data []byte
 }
 
-type simpleParameterizedOkCall struct {
-	cmd    byte
-	params []string
+type parameterizedOkCall struct {
+	cmd       byte
+	params    []string
+	converter convertParams
 }
 
-type simpleReturnCall struct {
+type onlyReturnCall struct {
 	data      []byte
 	converter convertReturnValues
 }
 
 type convertReturnValues func([]byte) string
 
-func (cmd *simpleOkCall) call(serial *Serial, _ map[string]string) string {
+type convertParams func([]string) ([]byte, error)
+
+func (cmd *okCall) call(serial *Serial, _ map[string]string) string {
 	_, err := serial.sendArray(cmd.data)
 	if err != nil {
 		return err.Error()
@@ -201,30 +250,38 @@ func (cmd *simpleOkCall) call(serial *Serial, _ map[string]string) string {
 	return "ok"
 }
 
-func (cmd *simpleParameterizedOkCall) call(serial *Serial, paramsMap map[string]string) string {
-	var data = []byte{cmd.cmd}
+func (cmd *parameterizedOkCall) call(serial *Serial, paramsMap map[string]string) string {
+	var params = make([]string, 0, 4)
 	for _, paramName := range cmd.params {
 		param, ok := paramsMap[paramName]
 		if !ok {
 			return "missing param: " + paramName
 		}
-		paramAsInt, err := strconv.Atoi(param)
-		if err != nil {
-			return err.Error()
-		}
-		if paramAsInt > 255 {
-			return "value " + param + " out of byte range"
-		}
-		data = append(data, byte(paramAsInt))
+		params = append(params, param)
 	}
-	_, err := serial.sendArray(data)
+	var data, err = cmd.converter(params)
+	if err != nil {
+		return err.Error()
+	}
+	_, err = serial.sendArray(data)
 	if err != nil {
 		return err.Error()
 	}
 	return "ok"
 }
 
-func (cmd *simpleReturnCall) call(serial *Serial, _ map[string]string) string {
+func paramToByte(param string) (byte, error) {
+	paramAsInt, err := strconv.Atoi(param)
+	if err != nil {
+		return 0, err
+	}
+	if paramAsInt < 0 || paramAsInt > 255 {
+		return 0, errors.New("value " + param + " out of byte range")
+	}
+	return byte(paramAsInt), nil
+}
+
+func (cmd *onlyReturnCall) call(serial *Serial, _ map[string]string) string {
 	returnData, err := serial.sendArray(cmd.data)
 	if err != nil {
 		return err.Error()
@@ -238,4 +295,49 @@ func convertAkkuCharge(bytes []byte) string {
 	charge = charge << 8
 	charge |= int(bytes[1])
 	return strconv.Itoa(charge)
+}
+
+func percentMapping(start int, end int) convertParams {
+	return mapping(0, 100, start, end)
+}
+
+func mapping(inStart int, inEnd int, outStart int, outEnd int) convertParams {
+	return forEach(func(param string) (byte, error) {
+		paramAsInt, err := strconv.Atoi(param)
+		if err != nil {
+			return 0, err
+		}
+		return doMapping(paramAsInt, inStart, inEnd, outStart, outEnd)
+	})
+}
+
+func doMapping(inValue int, inStart int, inEnd int, outStart int, outEnd int) (byte, error) {
+	if inStart >= inEnd {
+		return 0, errors.New("inStart has to be smaller then inEnd")
+	}
+	if inValue < inStart || inValue > inEnd {
+		return 0, errors.New("param has to be in inStart and inEnd range")
+	}
+	inSteps := inEnd - inStart
+	outRange := outEnd - outStart
+	value := outStart + ((outRange)*(inValue-inStart))/inSteps
+	return byte(value), nil
+}
+
+func noop() convertParams {
+	return forEach(paramToByte)
+}
+
+func forEach(singleConverter func(param string) (byte, error)) convertParams {
+	return func(params []string) ([]byte, error) {
+		data := make([]byte, len(params))
+		for i, param := range params {
+			b, err := singleConverter(param)
+			if err != nil {
+				return nil, err
+			}
+			data[i] = b
+		}
+		return data, nil
+	}
 }
