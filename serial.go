@@ -219,10 +219,10 @@ var cmdMapping = map[string]serialCmd{
 	"walk_turn_left":  &okCall{[]byte{CmdRegWalk, 128, 128, 0}},
 	"walk_turn_right": &okCall{[]byte{CmdRegWalk, 128, 128, 255}},
 
-	"sound":       &soundCall{},
-	"body_height": &parameterizedOkCall{CmdRegBodyHeight, []string{"height"}, percentMapping(0, 130)},
-	"speed":       &parameterizedOkCall{CmdRegSpeed, []string{"speed"}, percentMapping(100, 0)},
-	"walk":        &parameterizedMultiOkCall{CmdRegWalk, []string{"side", "forward", "turn"}, []convertParam{singleMapping(-100, 100, 1, 255), singleMapping(-100, 100, 255, 1), singleMapping(-100, 100, 1, 255)}},
+	"sound":       &parameterizedOkCall{CmdRegSound, []string{"duration", "frequency"}, []convertParam{paramToByte, mapping(0, 2550, 0, 255)}},
+	"body_height": &parameterizedOkCall{CmdRegBodyHeight, []string{"height"}, []convertParam{percentMapping(0, 130)}},
+	"speed":       &parameterizedOkCall{CmdRegSpeed, []string{"speed"}, []convertParam{percentMapping(100, 0)}},
+	"walk":        &parameterizedOkCall{CmdRegWalk, []string{"side", "forward", "turn"}, []convertParam{mapping(-100, 100, 1, 255), mapping(-100, 100, 255, 1), mapping(-100, 100, 1, 255)}},
 
 	"akku_charge": &onlyReturnCall{[]byte{CmdRegAkku}, convertAkkuCharge},
 }
@@ -238,12 +238,6 @@ type okCall struct {
 type parameterizedOkCall struct {
 	cmd       byte
 	params    []string
-	converter convertParams
-}
-
-type parameterizedMultiOkCall struct {
-	cmd       byte
-	params    []string
 	converter []convertParam
 }
 
@@ -251,13 +245,7 @@ type onlyReturnCall struct {
 	data      []byte
 	converter convertReturnValues
 }
-
-type soundCall struct {
-}
-
 type convertReturnValues func([]byte) string
-
-type convertParams func([]string) ([]byte, error)
 
 type convertParam func(string) (byte, error)
 
@@ -274,29 +262,13 @@ func (cmd *parameterizedOkCall) call(serial *Serial, paramsMap map[string]string
 	if err != nil {
 		return err.Error()
 	}
-	data, err := cmd.converter(params)
-	if err != nil {
-		return err.Error()
-	}
-	_, err = serial.sendArray(append(append(make([]byte, 0, 20), cmd.cmd), data...))
-	if err != nil {
-		return err.Error()
-	}
-	return "ok"
-}
-
-func (cmd *parameterizedMultiOkCall) call(serial *Serial, paramsMap map[string]string) string {
-	params, err := gatherParams(paramsMap, cmd.params)
-	if err != nil {
-		return err.Error()
-	}
 	data := make([]byte, len(cmd.params))
 	for i := 0; i < len(data); i++ {
-		byte, err := cmd.converter[i](params[i])
+		paramAsByte, err := cmd.converter[i](params[i])
 		if err != nil {
 			return err.Error()
 		}
-		data[i] = byte
+		data[i] = paramAsByte
 	}
 	_, err = serial.sendArray(append(append(make([]byte, 0, 20), cmd.cmd), data...))
 	if err != nil {
@@ -311,31 +283,6 @@ func (cmd *onlyReturnCall) call(serial *Serial, _ map[string]string) string {
 		return err.Error()
 	}
 	return cmd.converter(returnData)
-}
-
-func (cmd *soundCall) call(serial *Serial, paramsMap map[string]string) string {
-	params, err := gatherParams(paramsMap, []string{"duration", "frequency"})
-	if err != nil {
-		return err.Error()
-	}
-	duration, err := paramToByte(params[0])
-	if err != nil {
-		return err.Error()
-	}
-	frequency, err := strconv.Atoi(params[1])
-	if err != nil {
-		return err.Error()
-	}
-	mappedFrequency, err := doMapping(frequency, 0, 2550, 0, 255)
-	if err != nil {
-		return err.Error()
-	}
-
-	_, err = serial.sendArray([]byte{CmdRegSound, duration, mappedFrequency})
-	if err != nil {
-		return err.Error()
-	}
-	return "ok"
 }
 
 func gatherParams(paramsMap map[string]string, paramNames []string) ([]string, error) {
@@ -358,21 +305,11 @@ func convertAkkuCharge(bytes []byte) string {
 	return strconv.Itoa(charge)
 }
 
-func percentMapping(start int, end int) convertParams {
+func percentMapping(start int, end int) convertParam {
 	return mapping(0, 100, start, end)
 }
 
-func mapping(inStart int, inEnd int, outStart int, outEnd int) convertParams {
-	return forEach(func(param string) (byte, error) {
-		paramAsInt, err := strconv.Atoi(param)
-		if err != nil {
-			return 0, err
-		}
-		return doMapping(paramAsInt, inStart, inEnd, outStart, outEnd)
-	})
-}
-
-func singleMapping(inStart int, inEnd int, outStart int, outEnd int) convertParam {
+func mapping(inStart int, inEnd int, outStart int, outEnd int) convertParam {
 	return func(param string) (byte, error) {
 		paramAsInt, err := strconv.Atoi(param)
 		if err != nil {
@@ -393,20 +330,6 @@ func doMapping(inValue int, inStart int, inEnd int, outStart int, outEnd int) (b
 	outRange := outEnd - outStart
 	value := outStart + ((outRange)*(inValue-inStart))/inSteps
 	return byte(value), nil
-}
-
-func forEach(singleConverter func(param string) (byte, error)) convertParams {
-	return func(params []string) ([]byte, error) {
-		data := make([]byte, len(params))
-		for i, param := range params {
-			b, err := singleConverter(param)
-			if err != nil {
-				return nil, err
-			}
-			data[i] = b
-		}
-		return data, nil
-	}
 }
 
 func paramToByte(param string) (byte, error) {
