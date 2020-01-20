@@ -16,11 +16,11 @@ func TestDoMapping13(t *testing.T) {
 }
 func TestDoMapping2(t *testing.T) {
 	//callDoMapping(t, 5, 0, 10, 0, 100, 50)
-	for i := 0; i <= 100; i++ {
+	for i := -100; i <= 100; i++ {
 		print("i=")
 		print(i)
 		print(" ")
-		b, _ := doMapping(i, 0, 100, 10, 0)
+		b, _ := doMapping(i, -100, 100, 255, 1)
 		println(b)
 	}
 }
