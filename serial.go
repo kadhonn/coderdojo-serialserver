@@ -107,12 +107,20 @@ func (serial *Serial) sendArray(data []byte) ([]byte, error) {
 func (serial *Serial) sendBytes(cmd byte, data1 byte, data2 byte, data3 byte, data4 byte) ([]byte, error) {
 	var crc = CmdSync0 ^ CmdSync1 ^ cmd ^ data1 ^ data2 ^ data3 ^ data4
 
-	_, err := serial.port.Write([]byte{CmdSync0, CmdSync1, crc, cmd, data1, data2, data3, data4, CmdTermByte})
+	err := serial.write([]byte{CmdSync0, CmdSync1, crc, cmd, data1, data2, data3, data4, CmdTermByte})
 	if err != nil {
 		return nil, err
 	}
 
 	return serial.readResponse(cmd)
+}
+
+func (serial *Serial) write(bytes []byte) error {
+	//for i, readByte := range bytes {
+	//	log.Println("send byte[" + strconv.Itoa(i) + "]: " + strconv.Itoa(int(readByte)))
+	//}
+	_, err := serial.port.Write(bytes)
+	return err
 }
 
 func (serial *Serial) runCommand(cmd cmd) {
@@ -144,10 +152,10 @@ func (serial *Serial) runReadHandler() {
 	for {
 		read, err := serial.port.Read(buf)
 		if err != nil {
-			log.Println("error reading:", buf)
+			log.Println("error reading:", err)
 			continue
 		}
-		readBytes = append(readBytes, buf[:read]...)
+		readBytes = append(readBytes, buf[0:read]...)
 		for ; scanPosition < len(readBytes); scanPosition++ {
 			if readBytes[scanPosition] == CmdSync0 {
 				responseStart = scanPosition
@@ -169,9 +177,9 @@ func (serial *Serial) runReadHandler() {
 }
 
 func validate(readBytes []byte) ([]byte, error) {
-	for i, readByte := range readBytes {
-		log.Println("byte[" + strconv.Itoa(i) + "]: " + strconv.Itoa(int(readByte)))
-	}
+	//for i, readByte := range readBytes {
+	//	log.Println("receive byte[" + strconv.Itoa(i) + "]: " + strconv.Itoa(int(readByte)))
+	//}
 	if readBytes[0] != CmdSync0 {
 		return nil, errors.New("wrong sync byte 0 :( " + strconv.Itoa(int(readBytes[0])))
 	}
@@ -263,7 +271,7 @@ func (cmd *parameterizedOkCall) call(serial *Serial, paramsMap map[string]string
 	if err != nil {
 		return err.Error()
 	}
-	_, err = serial.sendArray(data)
+	_, err = serial.sendArray(append(append(make([]byte, 0, 20), cmd.cmd), data...))
 	if err != nil {
 		return err.Error()
 	}
